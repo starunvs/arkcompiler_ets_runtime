@@ -960,6 +960,66 @@ public:
     OBJECTREF_PUBLIC_HYBRID_EXTENSION();
 };
 
+// PropertyAccessor provides IC-accelerated (inline-cache) property access for native code.
+// When native code repeatedly accesses the same named property on objects with the same shape
+// (hidden class), PropertyAccessor caches the property offset and serves subsequent accesses
+// in O(1) time, bypassing the full property lookup pipeline.
+//
+// Usage:
+//   // Create once, reuse across many objects with the same shape
+//   auto nameAcc = PropertyAccessor::Create(vm, "name");
+//   auto priceAcc = PropertyAccessor::Create(vm, "price");
+//
+//   for (uint32_t i = 0; i < items->Length(vm); i++) {
+//       Local<ObjectRef> item = items->Get(vm, i);
+//       Local<JSValueRef> name = nameAcc->Get(vm, item);    // fast cached access
+//       Local<JSValueRef> price = priceAcc->Get(vm, item);  // fast cached access
+//   }
+//
+// The accessor internalizes the property key once at creation time and caches the
+// (HClass, property offset) pair. On cache hit (same object shape), the property is
+// read/written by direct offset without hash lookups or prototype chain walks.
+// On cache miss, it falls back to the standard property access path and updates the cache.
+class PUBLIC_API PropertyAccessor {
+public:
+    // Create an accessor for a property identified by a JSValueRef key (string or symbol).
+    // The key is internalized once and cached for the lifetime of this accessor.
+    static PropertyAccessor *Create(const EcmaVM *vm, Local<JSValueRef> key);
+
+    // Create an accessor for a property identified by a UTF-8 string key.
+    // The string is internalized once into the VM string table.
+    static PropertyAccessor *Create(const EcmaVM *vm, const char *utf8Key);
+
+    // Destroy a PropertyAccessor and release its resources.
+    static void Destroy(const EcmaVM *vm, PropertyAccessor *accessor);
+
+    // Fast cached property Get. If the object has the same hidden class (shape) as the
+    // previously accessed object, reads the property directly by offset in O(1).
+    // Falls back to the standard ObjectRef::Get path on cache miss and updates the cache.
+    Local<JSValueRef> Get(const EcmaVM *vm, Local<ObjectRef> object);
+
+    // Fast cached property Set. Same monomorphic cache fast-path for stores.
+    // Falls back to the standard ObjectRef::Set path on cache miss and updates the cache.
+    bool Set(const EcmaVM *vm, Local<ObjectRef> object, Local<JSValueRef> value);
+
+    // Reset the cached IC state. Call this if you know the object shape pattern has
+    // changed and you want to re-learn a new shape.
+    void Reset();
+
+private:
+    PropertyAccessor() = default;
+    ~PropertyAccessor() = default;
+
+    // Cached internalized property key (stored as raw tagged value from a global handle)
+    uintptr_t keyAddress_ {0};
+    // Cached hidden class pointer for monomorphic fast path
+    void *cachedHClass_ {nullptr};
+    // Cached PropertyAttributes value (stores offset, isInlined, isAccessor, etc.)
+    uint64_t cachedAttrValue_ {0};
+    // Whether the cache has been populated at least once
+    bool cacheValid_ {false};
+};
+
 using FunctionCallback = Local<JSValueRef>(*)(JsiRuntimeCallInfo*);
 using InternalFunctionCallback = JSValueRef(*)(JsiRuntimeCallInfo*);
 class PUBLIC_API FunctionRef : public ObjectRef {

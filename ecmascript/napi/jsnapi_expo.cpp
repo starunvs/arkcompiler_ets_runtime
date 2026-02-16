@@ -29,6 +29,7 @@
 #include "ecmascript/jsnapi_sendable.h"
 #include "ecmascript/jspandafile/js_pandafile_executor.h"
 #include "ecmascript/js_hclass.h"
+#include "ecmascript/layout_info.h"
 #include "ecmascript/lexical_env.h"
 #include "ecmascript/linked_hash_table.h"
 #include "ecmascript/mem/idle_gc_trigger.h"
@@ -136,6 +137,8 @@ using ecmascript::JSCollator;
 using ecmascript::JSDateTimeFormat;
 using ecmascript::JSNumberFormat;
 #endif
+using ecmascript::LayoutInfo;
+using ecmascript::PropertyAttributes;
 using ecmascript::DebugInfoExtractor;
 using ecmascript::JSWeakMap;
 using ecmascript::JSWeakSet;
@@ -2969,6 +2972,159 @@ bool ObjectRef::SetWithoutSwitchState(const EcmaVM *vm, const char *utf8, Local<
     return ObjectFastOperator::FastSetPropertyByValue(thread, obj.GetTaggedValue(),
                                                       key.GetTaggedValue(),
                                                       val.GetTaggedValue());
+}
+
+// ---------------------------------------------------------------------------
+// PropertyAccessor: IC-accelerated property access for native code
+// ---------------------------------------------------------------------------
+
+PropertyAccessor *PropertyAccessor::Create(const EcmaVM *vm, Local<JSValueRef> key)
+{
+    JSThread *thread = vm->GetJSThread();
+    ecmascript::ThreadManagedScope managedScope(thread);
+    auto *accessor = new PropertyAccessor();
+    // Store the key as a global handle so it survives across scopes/GC
+    uintptr_t localAddr = reinterpret_cast<uintptr_t>(*key);
+    accessor->keyAddress_ = thread->NewGlobalHandle(
+        *reinterpret_cast<JSTaggedType *>(localAddr));
+    accessor->cachedHClass_ = nullptr;
+    accessor->cachedAttrValue_ = 0;
+    accessor->cacheValid_ = false;
+    return accessor;
+}
+
+PropertyAccessor *PropertyAccessor::Create(const EcmaVM *vm, const char *utf8Key)
+{
+    JSThread *thread = vm->GetJSThread();
+    ecmascript::ThreadManagedScope managedScope(thread);
+    LocalScope scope(vm);
+    ObjectFactory *factory = vm->GetFactory();
+    JSHandle<JSTaggedValue> key(factory->NewFromUtf8(utf8Key));
+    auto *accessor = new PropertyAccessor();
+    accessor->keyAddress_ = thread->NewGlobalHandle(key.GetTaggedType());
+    accessor->cachedHClass_ = nullptr;
+    accessor->cachedAttrValue_ = 0;
+    accessor->cacheValid_ = false;
+    return accessor;
+}
+
+void PropertyAccessor::Destroy(const EcmaVM *vm, PropertyAccessor *accessor)
+{
+    if (accessor == nullptr) {
+        return;
+    }
+    if (accessor->keyAddress_ != 0) {
+        JSThread *thread = vm->GetJSThread();
+        ecmascript::ThreadManagedScope managedScope(thread);
+        thread->DisposeGlobalHandle(accessor->keyAddress_);
+        accessor->keyAddress_ = 0;
+    }
+    delete accessor;
+}
+
+Local<JSValueRef> PropertyAccessor::Get(const EcmaVM *vm, Local<ObjectRef> object)
+{
+    CROSS_THREAD_AND_EXCEPTION_CHECK_WITH_RETURN(vm, JSValueRef::Undefined(vm));
+    ecmascript::ThreadManagedScope managedScope(thread);
+    JSTaggedValue result;
+    {
+        LocalScope scope(vm);
+        JSHandle<JSTaggedValue> obj = JSNApiHelper::ToJSHandle(object);
+        if (UNLIKELY(!obj->IsHeapObject())) {
+            JSHandle<JSTaggedValue> key(thread, JSTaggedValue(
+                *reinterpret_cast<JSTaggedType *>(keyAddress_)));
+            OperationResult ret = JSTaggedValue::GetProperty(thread, obj, key);
+            RETURN_VALUE_IF_ABRUPT(thread, JSValueRef::Undefined(vm));
+            result = ret.GetValue().GetTaggedValue();
+        } else {
+            JSHClass *hclass = obj->GetTaggedObject()->GetClass();
+            // Monomorphic IC fast path: check if object has the cached hidden class (shape)
+            if (LIKELY(cacheValid_ && hclass == static_cast<JSHClass *>(cachedHClass_) &&
+                       !hclass->IsDictionaryMode())) {
+                PropertyAttributes cachedAttr(cachedAttrValue_);
+                if (LIKELY(!cachedAttr.IsAccessor())) {
+                    result = JSObject::Cast(obj->GetTaggedObject())->GetProperty(
+                        thread, hclass, cachedAttr);
+                } else {
+                    // Accessor property - fall through to generic path
+                    JSTaggedValue keyValue(*reinterpret_cast<JSTaggedType *>(keyAddress_));
+                    result = ObjectFastOperator::FastGetPropertyByValue(
+                        thread, obj.GetTaggedValue(), keyValue);
+                    RETURN_VALUE_IF_ABRUPT(thread, JSValueRef::Undefined(vm));
+                }
+            } else {
+                // IC miss: fall back to standard lookup and update cache
+                JSTaggedValue keyValue(*reinterpret_cast<JSTaggedType *>(keyAddress_));
+                result = ObjectFastOperator::FastGetPropertyByValue(
+                    thread, obj.GetTaggedValue(), keyValue);
+                RETURN_VALUE_IF_ABRUPT(thread, JSValueRef::Undefined(vm));
+                // Update monomorphic cache for non-dictionary objects
+                if (!hclass->IsDictionaryMode() && keyValue.IsStringOrSymbol()) {
+                    int entry = JSHClass::FindPropertyEntry(thread, hclass, keyValue);
+                    if (entry != -1) {
+                        LayoutInfo *layoutInfo = LayoutInfo::Cast(
+                            hclass->GetLayout(thread).GetTaggedObject());
+                        PropertyAttributes attr(layoutInfo->GetAttr(thread, entry));
+                        cachedHClass_ = hclass;
+                        cachedAttrValue_ = attr.GetValue();
+                        cacheValid_ = true;
+                    }
+                }
+            }
+        }
+    }
+    JSHandle<JSTaggedValue> resultValue(thread, result);
+    return JSNApiHelper::ToLocal<JSValueRef>(resultValue);
+}
+
+bool PropertyAccessor::Set(const EcmaVM *vm, Local<ObjectRef> object, Local<JSValueRef> value)
+{
+    CROSS_THREAD_AND_EXCEPTION_CHECK_WITH_RETURN(vm, false);
+    ecmascript::ThreadManagedScope managedScope(thread);
+    [[maybe_unused]] LocalScope scope(vm);
+    JSHandle<JSTaggedValue> obj = JSNApiHelper::ToJSHandle(object);
+    JSHandle<JSTaggedValue> val = JSNApiHelper::ToJSHandle(value);
+    if (UNLIKELY(!obj->IsHeapObject())) {
+        JSHandle<JSTaggedValue> key(thread, JSTaggedValue(
+            *reinterpret_cast<JSTaggedType *>(keyAddress_)));
+        return JSTaggedValue::SetProperty(thread, obj, key, val);
+    }
+    JSHClass *hclass = obj->GetTaggedObject()->GetClass();
+    // Monomorphic IC fast path for non-accessor, non-dictionary data properties
+    if (LIKELY(cacheValid_ && hclass == static_cast<JSHClass *>(cachedHClass_) &&
+               !hclass->IsDictionaryMode())) {
+        PropertyAttributes cachedAttr(cachedAttrValue_);
+        if (LIKELY(!cachedAttr.IsAccessor())) {
+            JSObject::Cast(obj->GetTaggedObject())->SetProperty<true>(
+                thread, hclass, cachedAttr, val.GetTaggedValue());
+            return true;
+        }
+    }
+    // IC miss or accessor: fall back to standard set and update cache
+    JSTaggedValue keyValue(*reinterpret_cast<JSTaggedType *>(keyAddress_));
+    bool success = ObjectFastOperator::FastSetPropertyByValue(
+        thread, obj.GetTaggedValue(), keyValue, val.GetTaggedValue());
+    RETURN_VALUE_IF_ABRUPT_COMPLETION(thread, false);
+    // Update monomorphic cache for non-dictionary objects
+    if (!hclass->IsDictionaryMode() && keyValue.IsStringOrSymbol()) {
+        int entry = JSHClass::FindPropertyEntry(thread, hclass, keyValue);
+        if (entry != -1) {
+            LayoutInfo *layoutInfo = LayoutInfo::Cast(
+                hclass->GetLayout(thread).GetTaggedObject());
+            PropertyAttributes attr(layoutInfo->GetAttr(thread, entry));
+            cachedHClass_ = hclass;
+            cachedAttrValue_ = attr.GetValue();
+            cacheValid_ = true;
+        }
+    }
+    return success;
+}
+
+void PropertyAccessor::Reset()
+{
+    cachedHClass_ = nullptr;
+    cachedAttrValue_ = 0;
+    cacheValid_ = false;
 }
 
 Local<JSValueRef> JSNApi::GetImplements(const EcmaVM *vm, Local<JSValueRef> instance)
